@@ -1,0 +1,123 @@
+name: Armbian RK322X Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: 'Kernel branch (current/legacy)'
+        required: true
+        default: 'current'
+        type: choice
+        options:
+        - current
+        - legacy
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'minimal'
+        type: choice
+        options:
+        - minimal
+        - desktop
+  schedule:
+    - cron: '0 0 * * *'  # Daily build at 00:00 UTC
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    container:
+      image: ubuntu:jammy
+      options: --privileged --device /dev/loop-control:/dev/loop-control
+
+    strategy:
+      matrix:
+        release: [jammy, bullseye]  # Ubuntu 22.04 & Debian 11
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        repository: CodeBoomAI/armbian-build-rk322x-box
+        submodules: recursive
+        path: armbian-build
+
+    - name: Setup QEMU
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-user-static
+        sudo update-binfmts --install i386 /usr/bin/qemu-i386-static --magic '\x7fELF\x01\x01\x01\x03\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00\x03\x00\x01\x00\x00\x00' --mask '\xff\xff\xff\xff\xff\xff\xff\xfc\xff\xff\xff\xff\xff\xff\xff\xff\xf8\xff\xff\xff\xff\xff\xff\xff'
+
+    - name: Install Dependencies
+      run: |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          build-essential ca-certificates ccache curl device-tree-compiler \
+          fdisk file gawk gcc-arm-linux-gnueabihf gcc-aarch64-linux-gnu git \
+          libncurses-dev libpython3-dev libssl-dev lsb-release lzop make \
+          parted pkg-config python3-dev python3-distutils python3-pip python3-setuptools \
+          rsync swig systemd-container u-boot-tools udev unzip wget whiptail \
+          zip zlib1g-dev bc bison flex libc6-dev libfdt-dev
+
+    - name: Setup CCache
+      run: |
+        mkdir -p ~/.ccache
+        echo "max_size = 2.0G" > ~/.ccache/ccache.conf
+        echo "cache_dir = $(pwd)/.ccache" >> ~/.ccache/ccache.conf
+
+    - name: Cache Dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.ccache
+          armbian-build/cache
+          armbian-build/userpatches
+        key: ${{ runner.os }}-armbian-${{ matrix.release }}-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-armbian-${{ matrix.release }}-
+
+    - name: Configure Build Parameters
+      run: |
+        cd armbian-build
+        cat << EOF > userpatches/config-override.conf
+        #!/bin/bash
+        BOARD="rk322x-box"
+        BRANCH="${{ inputs.kernel_branch || 'current' }}"
+        RELEASE="${{ matrix.release }}"
+        BUILD_MINIMAL="${{ inputs.build_type == 'minimal' && 'yes' || 'no' }}"
+        BUILD_DESKTOP="${{ inputs.build_type == 'desktop' && 'yes' || 'no' }}"
+        KERNEL_ONLY="no"
+        KERNEL_CONFIGURE="no"
+        COMPRESS_OUTPUTIMAGE="sha,gpg,img"
+        SKIP_EXTERNAL_TOOLCHAINS="yes"
+        FORCE_CCACHE="yes"
+        EXPERT="yes"
+        EOF
+
+    - name: Build Armbian Image
+      run: |
+        cd armbian-build
+        ./compile.sh 2>&1 | tee build.log
+      env:
+        CCACHE_DIR: /github/workspace/.ccache
+        CCACHE_MAXSIZE: 2G
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: armbian-${{ matrix.release }}-${{ inputs.kernel_branch || 'current' }}-${{ inputs.build_type || 'minimal' }}
+        path: |
+          armbian-build/output/images/*.img
+          armbian-build/output/debug/*.log
+          armbian-build/build.log
+        retention-days: 3
+
+    - name: Notify Build Status
+      if: always()
+      uses: rtCamp/action-slack-notify@v2
+      env:
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        STATUS: ${{ job.status }}
+        COLOR: ${{ job.status == 'success' && 'good' || 'danger' }}
+        TITLE: "Armbian Build (${{ matrix.release }})"
+        TEXT: "Build ${{ job.status }} for ${{ github.repository }}"
